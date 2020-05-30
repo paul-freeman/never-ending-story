@@ -1,45 +1,32 @@
 module Main exposing (main)
 
 import Browser
+import Browser.Events exposing (onAnimationFrame, onKeyDown, onKeyUp)
 import Dict exposing (Dict)
 import Element as E exposing (Element)
-import Element.Background
 import Element.Border as Border
-import Element.Input exposing (button, slider)
-import Random exposing (Generator, Seed)
+import Html.Events.Extra.Wheel as Wheel exposing (onWheel)
+import Http
+import Json.Decode as D exposing (Decoder)
+import Json.Decode.Pipeline exposing (optional)
+import Json.Encode as E exposing (Value)
+import List.Extra exposing (filterNot)
+import Movement exposing (Movement)
+import Position exposing (RoundedHex)
 import Svg exposing (Svg, svg)
 import Svg.Attributes as SA
-import Time
-
-
-type Msg
-    = Step
-    | ChangeRadius Float
-
-
-type Act
-    = One Float
-    | Two Float
-    | Three Float
-
-
-type alias Character =
-    { x : Int
-    , y : Int
-    , color : String
-    , lastStep : Maybe Direction
-    }
+import Task
+import Time exposing (Posix)
 
 
 type alias Model =
-    { story : Act
-    , characters : Dict String Character
-    , mainCharacter : Maybe String
-    , map : Dict ( Int, Int ) Content
-    , seed : Seed
+    { map : Dict ( Int, Int ) Content
+    , movement : Movement
     , width : Int
     , height : Int
-    , radius : Float
+    , size : Float
+    , minSize : Float
+    , maxSize : Float
     }
 
 
@@ -50,16 +37,15 @@ main =
         , update = update
         , subscriptions =
             \model ->
-                case model.story of
-                    One x ->
-                        if x < 1.0 then
-                            Time.every 200.0 (\_ -> Step)
+                Sub.batch
+                    [ Sub.map (KeyDown Nothing) (onKeyDown keyDecoder)
+                    , Sub.map KeyUp (onKeyUp keyDecoder)
+                    , if Movement.isMotion model.movement then
+                        onAnimationFrame Tick
 
-                        else
-                            Sub.none
-
-                    _ ->
+                      else
                         Sub.none
+                    ]
         , view = \model -> E.layout [] (mainLayout model)
         }
 
@@ -67,74 +53,138 @@ main =
 init : () -> ( Model, Cmd Msg )
 init _ =
     let
-        seed0 =
-            Random.initialSeed 10001
+        movement =
+            Movement.default
 
-        ( initialContent, seed1 ) =
-            generateContent 0 0 ( Dict.empty, seed0 )
+        map =
+            Dict.empty
 
-        ( initialCharacters, seed2 ) =
-            generateCharacter 0 0 "black" ( Dict.empty, seed1 )
+        size =
+            30
 
-        mainCharacter =
-            List.head (Dict.keys initialCharacters)
+        width =
+            480
+
+        height =
+            480
     in
-    ( { story = One 0.0
-      , characters = initialCharacters
-      , mainCharacter = mainCharacter
-      , map = initialContent
-      , seed = seed2
-      , width = 480
-      , height = 480
-      , radius = 10
+    ( { movement = movement
+      , map = map
+      , width = width
+      , height = height
+      , size = size
+      , minSize = 20
+      , maxSize = 100
       }
-    , Cmd.none
+    , (\l -> requestHexes l map) <|
+        Position.visibility movement.position size width height
     )
+
+
+type Msg
+    = Tick Posix
+    | GotContent (Result Http.Error (List Content))
+    | KeyDown (Maybe Posix) Direction
+    | KeyUp Direction
+    | Zoom Wheel.Event
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        Step ->
+        Tick time ->
             let
-                model1 =
-                    Dict.foldl stepCharacters { model | characters = Dict.empty } model.characters
+                newMovement =
+                    Movement.updatePosition model.size time model.movement
 
-                ( newX, newY ) =
-                    model1.mainCharacter
-                        |> Maybe.andThen (\n -> Dict.get n model1.characters)
-                        |> Maybe.map (\c -> ( c.x, c.y ))
-                        |> Maybe.withDefault ( 0, 0 )
+                oldHex =
+                    Position.roundHex model.movement.position model.size
 
-                ( characters1, seed1 ) =
-                    generateNewCharacter newX newY "red" ( model1.characters, model1.seed )
+                newHex =
+                    Position.roundHex newMovement.position model.size
 
-                story1 =
-                    case Dict.get ( newX, newY ) model1.map of
-                        Just c ->
-                            case model1.story of
-                                One p ->
-                                    One (min 1.0 (p + c.progression))
+                hasMoved =
+                    oldHex.q == newHex.q && oldHex.r == newHex.r
 
-                                Two p ->
-                                    Two (min 1.0 (p + c.progression))
+                loadList =
+                    if hasMoved then
+                        Position.visibility newMovement.position model.size model.width model.height
 
-                                Three p ->
-                                    Three (min 1.0 (p + c.progression))
-
-                        Nothing ->
-                            One 0
+                    else
+                        []
             in
-            ( { model1
-                | story = story1
-                , characters = characters1
-                , seed = seed1
+            ( { model | movement = newMovement }, requestHexes loadList model.map )
+
+        GotContent res ->
+            case res of
+                Err _ ->
+                    ( model, Cmd.none )
+
+                Ok content ->
+                    let
+                        newMap =
+                            List.map (\c -> ( ( c.q, c.r ), c )) content
+                                |> Dict.fromList
+                                |> Dict.union model.map
+                    in
+                    ( { model | map = newMap }, Cmd.none )
+
+        KeyDown mTime key ->
+            case mTime of
+                Nothing ->
+                    ( model, Task.perform (\posix -> KeyDown (Just posix) key) Time.now )
+
+                Just posix ->
+                    case key of
+                        Up ->
+                            ( { model | movement = Movement.add posix Movement.Up model.movement }, Cmd.none )
+
+                        Down ->
+                            ( { model | movement = Movement.add posix Movement.Down model.movement }, Cmd.none )
+
+                        Left ->
+                            ( { model | movement = Movement.add posix Movement.Left model.movement }, Cmd.none )
+
+                        Right ->
+                            ( { model | movement = Movement.add posix Movement.Right model.movement }, Cmd.none )
+
+                        Other ->
+                            ( model, Cmd.none )
+
+        KeyUp key ->
+            case key of
+                Up ->
+                    ( { model | movement = Movement.remove Movement.Up model.movement }, Cmd.none )
+
+                Down ->
+                    ( { model | movement = Movement.remove Movement.Down model.movement }, Cmd.none )
+
+                Left ->
+                    ( { model | movement = Movement.remove Movement.Left model.movement }, Cmd.none )
+
+                Right ->
+                    ( { model | movement = Movement.remove Movement.Right model.movement }, Cmd.none )
+
+                Other ->
+                    ( model, Cmd.none )
+
+        Zoom e ->
+            let
+                d =
+                    model.size - e.deltaY / 40
+
+                newSize =
+                    min (max d model.minSize) model.maxSize
+            in
+            ( { model
+                | movement =
+                    Movement.setPosition
+                        (Position.pixelAtNewSize model.size newSize model.movement.position)
+                        model.movement
+                , size = newSize
               }
             , Cmd.none
             )
-
-        ChangeRadius newRadius ->
-            ( { model | radius = newRadius }, Cmd.none )
 
 
 mainLayout : Model -> Element Msg
@@ -146,7 +196,10 @@ mainLayout model =
         [ E.row
             [ E.centerX
             ]
-            [ E.el [ Border.width 3 ]
+            [ E.el
+                [ Border.width 3
+                , E.htmlAttribute (Wheel.onWheel Zoom)
+                ]
                 (E.html <|
                     svg
                         [ SA.width (String.fromInt model.width)
@@ -159,492 +212,243 @@ mainLayout model =
                                 , String.fromInt model.height
                                 ]
                         ]
-                        (hexgrid model model.width model.height model.radius
-                            ++ drawPawns model
-                        )
-                )
-            , E.html <|
-                svg
-                    [ SA.width (String.fromInt (model.width // 20))
-                    , SA.height (String.fromInt model.height)
-                    , SA.viewBox <|
-                        String.join " "
-                            [ "0"
-                            , "0"
-                            , String.fromInt (model.width // 20)
-                            , String.fromInt model.height
-                            ]
-                    ]
-                    [ Svg.rect
-                        [ SA.x "0"
-                        , SA.y (String.fromFloat (toFloat model.height - toFloat model.height * progressToFloat model))
-                        , SA.width (String.fromInt (model.width // 20))
-                        , SA.height (String.fromInt model.height)
-                        , SA.fill "pink"
+                        [ hexgrid model
+                        , Svg.circle [ SA.cx "0", SA.cy "0", SA.r "3", SA.fill "black" ] []
                         ]
-                        []
-                    ]
-            ]
-        , E.el
-            [ E.width (E.px model.width)
-            , E.centerX
-            ]
-            (slider
-                [ E.width E.fill
-                , E.height (E.px 30)
-                ]
-                { onChange = ChangeRadius
-                , label = Element.Input.labelAbove [] (E.text "Zoom")
-                , min = 5
-                , max = 60
-                , step = Nothing
-                , value = model.radius
-                , thumb = Element.Input.defaultThumb
-                }
-            )
-        , E.row
-            [ E.width (E.px model.width)
-            , E.height E.fill
-            , E.centerX
-            ]
-            [ E.column [ E.height E.fill, E.width E.fill ]
-                [ E.paragraph []
-                    [ E.text <|
-                        case model.mainCharacter of
-                            Just name ->
-                                case Dict.get name model.characters of
-                                    Just mainCharacter ->
-                                        String.concat
-                                            [ name
-                                            , " travels "
-                                            , directionToString (mainCharacterLastStep model)
-                                            , " and arrives at "
-                                            , String.fromInt mainCharacter.x
-                                            , ","
-                                            , String.fromInt mainCharacter.y
-                                            ]
-
-                                    Nothing ->
-                                        "Nothing happened."
-
-                            Nothing ->
-                                "Nothing happened."
-                    ]
-                ]
-            , button [ E.height (E.px 100), E.alignTop ]
-                { onPress = Just Step
-                , label = E.text "Next"
-                }
+                )
             ]
         ]
 
 
-drawPawns : Model -> List (Svg msg)
-drawPawns model =
-    case model.mainCharacter |> Maybe.andThen (\n -> Dict.get n model.characters) of
-        Nothing ->
-            []
+hexgrid : Model -> Svg Msg
+hexgrid model =
+    Svg.g
+        []
+        (List.concatMap
+            (\hex ->
+                let
+                    mContent =
+                        Dict.get ( hex.q, hex.r ) model.map
 
-        Just mainCharacter ->
-            Dict.values model.characters
-                |> List.indexedMap
-                    (\n c ->
-                        let
-                            ( x, y ) =
-                                calcHexPosition ( mainCharacter.x, mainCharacter.y )
-                                    model.radius
-                                    ( c.x - mainCharacter.x, c.y - mainCharacter.y )
-                        in
-                        Svg.circle
-                            [ SA.cx (String.fromFloat (x + toFloat n * (model.radius / 4)))
-                            , SA.cy (String.fromFloat y)
-                            , SA.r (String.fromFloat (model.radius / 8))
-                            , SA.fill c.color
-                            ]
-                            []
-                    )
+                    cx =
+                        model.size * ((3 / 2) * toFloat hex.q)
 
-
-hexgrid : Model -> Int -> Int -> Float -> List (Svg msg)
-hexgrid model w h r =
-    let
-        d =
-            sqrt 3 / 2
-
-        numRows =
-            toFloat h / (d * r)
-    in
-    List.range -(ceiling (numRows / 2)) (ceiling (numRows / 2))
-        |> List.map
-            (\y ->
-                hexRow model w y r (modBy 2 y /= 0)
+                    cy =
+                        model.size * ((sqrt 3 / 2) * toFloat hex.q + sqrt 3 * toFloat hex.r)
+                in
+                hexagon
+                    { cx = model.movement.position.x - cx
+                    , cy = model.movement.position.y - cy
+                    , size = model.size
+                    , content = mContent
+                    }
             )
-        |> List.concat
+            (Position.visibility { x = model.movement.position.x, y = model.movement.position.y } model.size model.width model.height)
+        )
 
 
-hexRow : Model -> Int -> Int -> Float -> Bool -> List (Svg msg)
-hexRow model w y r oddRow =
-    case model.mainCharacter |> Maybe.andThen (\n -> Dict.get n model.characters) of
+hexagon : { cx : Float, cy : Float, size : Float, content : Maybe Content } -> List (Svg msg)
+hexagon p =
+    case p.content of
         Nothing ->
             []
 
-        Just mainCharacter ->
-            let
-                hexesPerRow =
-                    toFloat w / (3 * r)
+        Just content ->
+            case content.shape of
+                Circle ->
+                    [ Svg.circle
+                        [ SA.cx (String.fromFloat p.cx)
+                        , SA.cy (String.fromFloat p.cy)
+                        , SA.r (String.fromFloat (p.size / 2))
+                        , SA.stroke "black"
+                        , SA.strokeWidth "3"
+                        , SA.fill "red"
+                        ]
+                        []
+                    ]
 
-                d =
-                    sqrt 3 / 2
+                Square ->
+                    [ Svg.rect
+                        [ SA.x (String.fromFloat (p.cx - p.size / 4))
+                        , SA.y (String.fromFloat (p.cy - p.size / 4))
+                        , SA.width (String.fromFloat (p.size / 2))
+                        , SA.height (String.fromFloat (p.size / 2))
+                        , SA.stroke "black"
+                        , SA.strokeWidth "3"
+                        , SA.fill "green"
+                        ]
+                        []
+                    ]
 
-                range =
-                    List.range -(ceiling (hexesPerRow / 2)) (ceiling (hexesPerRow / 2))
-            in
-            range
-                |> List.concatMap
-                    (\x ->
-                        let
-                            mContent =
-                                Dict.get ( mainCharacter.x + x, mainCharacter.y + y ) model.map
+                Triangle ->
+                    []
 
-                            offset =
-                                if oddRow then
-                                    if modBy 2 mainCharacter.y == 0 then
-                                        1.5 * r
-
-                                    else
-                                        -1.5 * r
-
-                                else
-                                    0.0
-                        in
-                        hexagon (3 * r * toFloat x + offset) (r * toFloat y * d) r mContent
-                    )
-
-
-calcHexPosition : ( Int, Int ) -> Float -> ( Int, Int ) -> ( Float, Float )
-calcHexPosition ( _, n ) r ( x, y ) =
-    let
-        d =
-            sqrt 3 / 2
-
-        offset =
-            if modBy 2 y /= 0 then
-                if modBy 2 n /= 0 then
-                    -1.5 * r
-
-                else
-                    1.5 * r
-
-            else
-                0.0
-    in
-    ( 3 * r * toFloat x + offset, r * toFloat y * d )
+                _ ->
+                    []
 
 
-hexagon : Float -> Float -> Float -> Maybe Content -> List (Svg msg)
-hexagon cx cy r mContent =
+type alias HexagonParams =
+    { x : Int
+    , y : Int
+    , z : Int
+    , cx : Float
+    , cy : Float
+    , size : Float
+    , color : String
+    , content : Maybe Content
+    }
+
+
+debugHexagon : HexagonParams -> Svg msg
+debugHexagon p =
     let
         a =
-            String.fromFloat (r + cx) ++ "," ++ String.fromFloat (0 + cy)
+            String.fromFloat (p.size + p.cx) ++ "," ++ String.fromFloat p.cy
 
         b =
-            String.fromFloat (r / 2 + cx) ++ "," ++ String.fromFloat (sqrt 3 * r / 2 + cy)
+            String.fromFloat (p.size / 2 + p.cx) ++ "," ++ String.fromFloat (sqrt 3 * p.size / 2 + p.cy)
 
         c =
-            String.fromFloat (-r / 2 + cx) ++ "," ++ String.fromFloat (sqrt 3 * r / 2 + cy)
+            String.fromFloat (-p.size / 2 + p.cx) ++ "," ++ String.fromFloat (sqrt 3 * p.size / 2 + p.cy)
 
         d =
-            String.fromFloat (-r + cx) ++ "," ++ String.fromFloat (0 + cy)
+            String.fromFloat (0 - p.size + p.cx) ++ "," ++ String.fromFloat p.cy
 
         e =
-            String.fromFloat (-r / 2 + cx) ++ "," ++ String.fromFloat (-(sqrt 3) * r / 2 + cy)
+            String.fromFloat (-p.size / 2 + p.cx) ++ "," ++ String.fromFloat (-(sqrt 3) * p.size / 2 + p.cy)
 
         f =
-            String.fromFloat (r / 2 + cx) ++ "," ++ String.fromFloat (-(sqrt 3) * r / 2 + cy)
+            String.fromFloat (p.size / 2 + p.cx) ++ "," ++ String.fromFloat (-(sqrt 3) * p.size / 2 + p.cy)
 
         points =
             SA.points <| String.join " " [ a, b, c, d, e, f ]
 
         ( stroke, fill ) =
-            case mContent of
+            case p.content of
                 Nothing ->
-                    ( "gray", "gray" )
+                    ( "gray", p.color )
 
                 Just content ->
-                    if content.x == 0 && content.y == 0 then
+                    if content.q == 0 && content.r == 0 then
                         ( "black", "pink" )
 
-                    else if modBy 11 content.r == 0 then
-                        ( "black", "lightgray" )
-
                     else
-                        ( "none", "white" )
+                        ( "black", "white" )
     in
-    [ Svg.polygon
-        [ SA.fill fill, SA.stroke stroke, points ]
-        []
-    ]
+    Svg.g []
+        [ Svg.polygon [ SA.fill fill, SA.stroke stroke, points ] []
+        , Svg.text_
+            [ SA.x (String.fromFloat (-0.6 * p.size + p.cx))
+            , SA.y (String.fromFloat (-0.2 * p.size + p.cy))
+            , SA.fontSize (String.fromFloat (0.4 * p.size) ++ "px")
+            ]
+            [ Svg.text (String.fromInt p.x) ]
+        , Svg.text_
+            [ SA.x (String.fromFloat (0.2 * p.size + p.cx))
+            , SA.y (String.fromFloat (-0.2 * p.size + p.cy))
+            , SA.fontSize (String.fromFloat (0.4 * p.size) ++ "px")
+            ]
+            [ Svg.text (String.fromInt p.y) ]
+        , Svg.text_
+            [ SA.x (String.fromFloat (-0.2 * p.size + p.cx))
+            , SA.y (String.fromFloat (0.6 * p.size + p.cy))
+            , SA.fontSize (String.fromFloat (0.4 * p.size) ++ "px")
+            ]
+            [ Svg.text (String.fromInt p.z) ]
+        ]
 
 
 type alias Content =
-    { x : Int
-    , y : Int
+    { q : Int
     , r : Int
-    , progression : Float
+    , shape : Shape
     }
 
 
-generateContent : Int -> Int -> ( Dict ( Int, Int ) Content, Seed ) -> ( Dict ( Int, Int ) Content, Seed )
-generateContent x y state =
-    let
-        center =
-            ( x, y )
-
-        up =
-            ( x, y - 2 )
-
-        down =
-            ( x, y + 2 )
-
-        upToLeft =
-            ( if modBy 2 y == 0 then
-                x - 1
-
-              else
-                x
-            , y - 1
-            )
-
-        upToRight =
-            ( if modBy 2 y == 1 then
-                x + 1
-
-              else
-                x
-            , y - 1
-            )
-
-        downToLeft =
-            ( if modBy 2 y == 0 then
-                x - 1
-
-              else
-                x
-            , y + 1
-            )
-
-        downToRight =
-            ( if modBy 2 y == 1 then
-                x + 1
-
-              else
-                x
-            , y + 1
-            )
-    in
-    [ center, up, down, upToLeft, upToRight, downToLeft, downToRight ]
-        |> List.foldl
-            (\a ( d, seed0 ) ->
-                case Dict.get a d of
-                    Nothing ->
-                        let
-                            ( progression, seed1 ) =
-                                Random.step (Random.float 0 (1 / 500)) seed0
-
-                            ( c, seed2 ) =
-                                Random.step
-                                    (Random.int 0 Random.maxInt
-                                        |> Random.map
-                                            (\r ->
-                                                { x = Tuple.first a
-                                                , y = Tuple.second a
-                                                , r = r
-                                                , progression = progression
-                                                }
-                                            )
-                                    )
-                                    seed1
-                        in
-                        ( Dict.insert a c d, seed2 )
-
-                    Just _ ->
-                        ( d, seed0 )
-            )
-            state
-
-
-generateCharacter : Int -> Int -> String -> ( Dict String Character, Seed ) -> ( Dict String Character, Seed )
-generateCharacter x y color ( characters, seed0 ) =
-    let
-        ( a, seed1 ) =
-            Random.step (Random.uniform 'B' (String.toList "CDFGHJKLMNPRSTVWZ")) seed0
-
-        ( b, seed2 ) =
-            Random.step (Random.uniform 'a' (String.toList "eiou")) seed1
-
-        ( c, seed3 ) =
-            Random.step (Random.uniform 'b' (String.toList "cdfghjklmnprstvwz")) seed2
-
-        name =
-            String.fromList [ a, b, c ]
-    in
-    if Dict.member name characters then
-        generateCharacter x y color ( characters, seed3 )
-
-    else
-        ( Dict.insert name { x = x, y = y, color = color, lastStep = Nothing } characters, seed3 )
-
-
-generateNewCharacter : Int -> Int -> String -> ( Dict String Character, Seed ) -> ( Dict String Character, Seed )
-generateNewCharacter x y color ( characters0, seed0 ) =
-    if Dict.size characters0 >= 2 then
-        ( characters0, seed0 )
-
-    else
-        let
-            ( r, seed1 ) =
-                Random.step (Random.float 0 1) seed0
-        in
-        if r > 0.1 then
-            ( characters0, seed1 )
-
-        else
-            generateCharacter x y color ( characters0, seed1 )
-
-
 type Direction
-    = Up
+    = Left
+    | Right
+    | Up
     | Down
-    | UpToLeft
-    | UpToRight
-    | DownToLeft
-    | DownToRight
+    | Other
 
 
-generateDirection : Generator Direction
-generateDirection =
-    Random.uniform Up [ Down, UpToLeft, UpToRight, DownToLeft, DownToRight ]
+keyDecoder : Decoder Direction
+keyDecoder =
+    D.map toDirection (D.field "key" D.string)
 
 
-directionToString : Maybe Direction -> String
-directionToString m =
-    case m of
-        Nothing ->
-            "nowhere"
+toDirection : String -> Direction
+toDirection string =
+    case string of
+        "ArrowLeft" ->
+            Left
 
-        Just d ->
-            case d of
-                Up ->
-                    "north"
+        "ArrowRight" ->
+            Right
 
-                Down ->
-                    "south"
+        "ArrowUp" ->
+            Up
 
-                UpToLeft ->
-                    "northwest"
+        "ArrowDown" ->
+            Down
 
-                UpToRight ->
-                    "northeast"
-
-                DownToLeft ->
-                    "southwest"
-
-                DownToRight ->
-                    "southeast"
+        _ ->
+            Other
 
 
-calcNewXY : Character -> Direction -> ( Int, Int )
-calcNewXY character direction =
-    let
-        x =
-            character.x
-
-        y =
-            character.y
-    in
-    case direction of
-        Up ->
-            ( x, y - 2 )
-
-        Down ->
-            ( x, y + 2 )
-
-        UpToLeft ->
-            ( if modBy 2 y == 0 then
-                x - 1
-
-              else
-                x
-            , y - 1
-            )
-
-        UpToRight ->
-            ( if modBy 2 y == 1 then
-                x + 1
-
-              else
-                x
-            , y - 1
-            )
-
-        DownToLeft ->
-            ( if modBy 2 y == 0 then
-                x - 1
-
-              else
-                x
-            , y + 1
-            )
-
-        DownToRight ->
-            ( if modBy 2 y == 1 then
-                x + 1
-
-              else
-                x
-            , y + 1
-            )
+requestHexes : List RoundedHex -> Dict ( Int, Int ) Content -> Cmd Msg
+requestHexes loadList map =
+    postHexesRequest <|
+        filterNot (\k -> Dict.member ( k.q, k.r ) map) loadList
 
 
-mainCharacterLastStep : Model -> Maybe Direction
-mainCharacterLastStep model =
-    model.mainCharacter
-        |> Maybe.andThen (\n -> Dict.get n model.characters)
-        |> Maybe.andThen .lastStep
+postHexesRequest : List RoundedHex -> Cmd Msg
+postHexesRequest hexes =
+    Http.post
+        { url = "locations"
+        , body = Http.jsonBody (E.list hexEncoder hexes)
+        , expect = Http.expectJson GotContent (D.list contentDecoder)
+        }
 
 
-progressToFloat : Model -> Float
-progressToFloat model =
-    case model.story of
-        One f ->
-            f
-
-        Two f ->
-            f
-
-        Three f ->
-            f
+hexEncoder : RoundedHex -> Value
+hexEncoder hex =
+    E.object
+        [ ( "Q", E.int hex.q )
+        , ( "R", E.int hex.r )
+        ]
 
 
-stepCharacters : String -> Character -> Model -> Model
-stepCharacters name character model =
-    let
-        ( direction, seed1 ) =
-            Random.step generateDirection model.seed
+contentDecoder : Decoder Content
+contentDecoder =
+    D.succeed Content
+        |> optional "Q" D.int 0
+        |> optional "R" D.int 0
+        |> optional "Shape" (D.map shapeFromInt D.int) Circle
 
-        ( newX, newY ) =
-            calcNewXY character direction
 
-        ( map1, seed2 ) =
-            generateContent newX newY ( model.map, seed1 )
+type Shape
+    = Empty
+    | Circle
+    | Triangle
+    | Square
 
-        characters1 =
-            Dict.insert name
-                { x = newX
-                , y = newY
-                , color = character.color
-                , lastStep = Just direction
-                }
-                model.characters
-    in
-    { model | characters = characters1, map = map1, seed = seed2 }
+
+shapeFromInt : Int -> Shape
+shapeFromInt n =
+    case n of
+        0 ->
+            Empty
+
+        1 ->
+            Circle
+
+        2 ->
+            Triangle
+
+        3 ->
+            Square
+
+        _ ->
+            Empty

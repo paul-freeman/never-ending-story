@@ -1,14 +1,13 @@
-module Movement exposing (Direction(..), Movement, add, default, remove, setPosition, updatePosition)
+module Movement exposing (Direction(..), Movement, add, default, isMotion, remove, setPosition, updatePosition)
 
 import Force exposing (Force)
+import Maybe.Extra exposing (isJust, orList)
+import Position exposing (Pixel)
 import Time exposing (Posix)
 
 
 type alias Movement =
-    { position :
-        { x : Float
-        , y : Float
-        }
+    { position : Pixel
     , keys :
         { up : Maybe Force
         , down : Maybe Force
@@ -92,7 +91,7 @@ remove direction { position, keys } =
             { position = position, keys = { keys | right = Nothing } }
 
 
-setPosition : { x : Float, y : Float } -> Movement -> Movement
+setPosition : Pixel -> Movement -> Movement
 setPosition pos movement =
     { movement | position = pos }
 
@@ -115,10 +114,23 @@ updatePosition size posix { position, keys } =
         rightMove =
             Maybe.map (Force.value posix) keys.right
                 |> Maybe.withDefault 0.0
+
+        pos =
+            { x = position.x + (size / 10) * (leftMove - rightMove)
+            , y = position.y + (size / 10) * (upMove - downMove)
+            }
     in
-    { position =
-        { x = position.x + (size / 10) * (leftMove - rightMove)
-        , y = position.y + (size / 10) * (upMove - downMove)
-        }
+    { position = { x = pos.x, y = pos.y }
     , keys = keys
     }
+
+
+isMotion : Movement -> Bool
+isMotion movement =
+    orList
+        [ movement.keys.up
+        , movement.keys.down
+        , movement.keys.left
+        , movement.keys.right
+        ]
+        |> isJust
